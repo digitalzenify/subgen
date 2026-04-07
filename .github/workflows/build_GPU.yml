@@ -10,10 +10,13 @@ on:
 jobs:
   docker:
     runs-on: [self-hosted]
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -23,11 +26,12 @@ jobs:
           version=$(grep -oP "subgen_version\s*=\s*'\K[^']+" subgen.py)
           echo "version=$version" >> $GITHUB_ENV
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push GPU Docker image
         uses: docker/build-push-action@v5
@@ -35,5 +39,5 @@ jobs:
           context: .
           push: true
           tags: |
-            mccloud/subgen:latest
-            mccloud/subgen:${{ env.version }}
+            ghcr.io/${{ github.repository_owner }}/subgen:latest
+            ghcr.io/${{ github.repository_owner }}/subgen:${{ env.version }}
