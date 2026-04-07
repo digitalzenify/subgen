@@ -251,7 +251,11 @@ def transcribe_with_groq(audio_file_path: str, language: str = None) -> str:
     if groq_client is None:
         init_groq_client()
     
-    file_size_mb = os.path.getsize(audio_file_path) / (1024 * 1024)
+    try:
+        file_size_mb = os.path.getsize(audio_file_path) / (1024 * 1024)
+    except OSError as e:
+        logging.error(f"Cannot access audio file {audio_file_path}: {e}")
+        raise
     
     if file_size_mb <= groq_max_chunk_size_mb:
         # Single file, send directly
@@ -389,9 +393,10 @@ def _verbose_json_to_srt(result, offset: float = 0.0) -> str:
     
     srt_lines = []
     for i, seg in enumerate(segments, 1):
-        start = (seg.get('start', 0) if isinstance(seg, dict) else getattr(seg, 'start', 0)) + offset
-        end = (seg.get('end', 0) if isinstance(seg, dict) else getattr(seg, 'end', 0)) + offset
-        text = (seg.get('text', '') if isinstance(seg, dict) else getattr(seg, 'text', '')).strip()
+        # Groq SDK returns segment objects with attributes (not dicts)
+        start = getattr(seg, 'start', 0) + offset
+        end = getattr(seg, 'end', 0) + offset
+        text = getattr(seg, 'text', '').strip()
         
         if not text:
             continue
@@ -1241,32 +1246,37 @@ def _prepare_audio_for_groq(file_path: str, language: LanguageCode = None) -> st
             track_index = audio_tracks[0]['index']
         
         # Extract to temp mp3
-        tmp_audio = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False, prefix='subgen_audio_')
-        tmp_audio.close()
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mp3', prefix='subgen_audio_')
+        os.close(tmp_fd)
         
-        input_stream = ffmpeg.input(file_path)
-        if track_index is not None:
-            output_stream = input_stream.output(
-                tmp_audio.name,
-                map=f"0:{track_index}",
-                acodec='libmp3lame',
-                ab='64k',
-                ac=1,
-                ar=16000,
-                loglevel='warning'
-            )
-        else:
-            output_stream = input_stream.output(
-                tmp_audio.name,
-                acodec='libmp3lame',
-                ab='64k',
-                ac=1,
-                ar=16000,
-                loglevel='warning'
-            )
-        
-        output_stream.overwrite_output().run(capture_stdout=True, capture_stderr=True)
-        return tmp_audio.name
+        try:
+            input_stream = ffmpeg.input(file_path)
+            if track_index is not None:
+                output_stream = input_stream.output(
+                    tmp_path,
+                    map=f"0:{track_index}",
+                    acodec='libmp3lame',
+                    ab='64k',
+                    ac=1,
+                    ar=16000,
+                    loglevel='warning'
+                )
+            else:
+                output_stream = input_stream.output(
+                    tmp_path,
+                    acodec='libmp3lame',
+                    ab='64k',
+                    ac=1,
+                    ar=16000,
+                    loglevel='warning'
+                )
+            
+            output_stream.overwrite_output().run(capture_stdout=True, capture_stderr=True)
+            return tmp_path
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
         
     except Exception as e:
         logging.error(f"Error extracting audio from {file_path}: {e}")

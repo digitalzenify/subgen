@@ -5,7 +5,7 @@ services:
       image: ghcr.io/digitalzenify/subgen:latest
       environment:
          # Groq API Configuration (REQUIRED)
-         - "GROQ_API_KEY="                            # Required. Get from console.groq.com
+         - "GROQ_API_KEY=your_api_key_here"            # Required. Get from console.groq.com
          - "GROQ_MODEL=whisper-large-v3-turbo"        # Options: whisper-large-v3, whisper-large-v3-turbo
          - "GROQ_MAX_CHUNK_SIZE_MB=20"                # Max chunk size (must be under 25MB for free tier)
          - "GROQ_RETRY_ATTEMPTS=3"                    # Retries on rate limit / transient errors
