@@ -1,4 +1,4 @@
-subgen_version = '2026.04.5'
+subgen_version = '2026.04.9'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -327,12 +327,13 @@ def _transcribe_chunked(audio_file_path: str, language: str = None) -> str:
     chunk_dir = tempfile.mkdtemp(prefix="subgen_chunks_")
     
     try:
-        # Convert to mp3 chunks of ~10 minutes each using ffmpeg
-        chunk_pattern = os.path.join(chunk_dir, "chunk_%03d.mp3")
+        # Convert to flac chunks of ~10 minutes each using ffmpeg
+        # flac is universally available in standard ffmpeg builds (no libmp3lame needed)
+        chunk_pattern = os.path.join(chunk_dir, "chunk_%03d.flac")
         cmd = [
             "ffmpeg", "-i", audio_file_path,
             "-f", "segment", "-segment_time", "600",
-            "-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1",
+            "-c:a", "flac", "-ac", "1",
             "-ar", "16000",
             chunk_pattern,
             "-y", "-loglevel", "warning"
@@ -343,7 +344,7 @@ def _transcribe_chunked(audio_file_path: str, language: str = None) -> str:
         # Get sorted chunk files
         chunk_files = sorted([
             os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) 
-            if f.startswith("chunk_") and f.endswith(".mp3")
+            if f.startswith("chunk_") and f.endswith(".flac")
         ])
         
         if not chunk_files:
