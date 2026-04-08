@@ -1,4 +1,4 @@
-subgen_version = '2026.04.18'
+subgen_version = '2026.04.19'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -368,28 +368,74 @@ def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filenam
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         wav_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
-        if result.returncode != 0 or wav_size <= MIN_WAV_SIZE:
-            # Log the source file's audio codec via ffprobe for debugging
+        if result.returncode == 0 and wav_size > MIN_WAV_SIZE:
+            return transcribe_with_groq(wav_path, language)
+
+        # Initial extraction failed. Try to probe the source and gather debug info.
+        try:
+            probe = ffmpeg.probe(src_path)
+            audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
+            logging.error(
+                f"Audio extraction initial attempt failed (exit code {result.returncode}, wav_size={wav_size}). "
+                f"Source audio streams: {[s.get('codec_name') for s in audio_streams]}. "
+                f"ffmpeg stderr: {result.stderr.strip()}"
+            )
+        except Exception as probe_err:
+            # If ffprobe failed, log the first bytes of the file to help diagnosis
             try:
-                probe = ffmpeg.probe(src_path)
-                audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
-                logging.error(
-                    f"Audio extraction failed (exit code {result.returncode}, wav_size={wav_size}). "
-                    f"Source audio streams: {[s.get('codec_name') for s in audio_streams]}. "
-                    f"ffmpeg stderr: {result.stderr.strip()}"
-                )
-            except Exception as probe_err:
-                logging.error(
-                    f"Audio extraction failed (exit code {result.returncode}, wav_size={wav_size}) "
-                    f"and ffprobe also failed: {probe_err}. "
-                    f"ffmpeg stderr: {result.stderr.strip()}"
-                )
-            raise RuntimeError(
-                f"Failed to extract audio from source file (exit code {result.returncode}): "
-                f"{result.stderr.strip()}"
+                with open(src_path, 'rb') as sf:
+                    head = sf.read(256)
+                head_hex = head.hex()
+            except Exception as e:
+                head_hex = f"<could not read src file: {e}>"
+            logging.error(
+                f"Audio extraction failed (exit code {result.returncode}, wav_size={wav_size}) "
+                f"and ffprobe also failed: {probe_err}. First bytes: {head_hex}. ffmpeg stderr: {result.stderr.strip()}"
             )
 
-        return transcribe_with_groq(wav_path, language)
+        # Attempt retries by forcing input format hints to ffmpeg. Map common extensions
+        # to the expected ffmpeg format names.
+        ext_to_fmt = {
+            'mkv': 'matroska', 'mp4': 'mp4', 'mov': 'mov', 'webm': 'webm',
+            'wav': 'wav', 'ogg': 'ogg', 'flac': 'flac', 'mp3': 'mp3'
+        }
+
+        tried = set()
+        candidates = []
+        if detected_ext:
+            candidates.append(detected_ext.lstrip('.'))
+        fname_ext = os.path.splitext(filename)[1].lstrip('.')
+        if fname_ext:
+            candidates.append(fname_ext)
+        candidates.extend(['mkv', 'mp4', 'mov', 'webm', 'wav'])
+
+        for ext in candidates:
+            if not ext or ext in tried:
+                continue
+            tried.add(ext)
+            fmt = ext_to_fmt.get(ext, ext)
+            try:
+                cmd_force = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-f", fmt,
+                    "-i", src_path,
+                    "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                    wav_path,
+                ]
+                logging.debug(f"Retrying extraction forcing format '{fmt}': {' '.join(cmd_force)}")
+                result_force = subprocess.run(cmd_force, capture_output=True, text=True)
+                wav_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
+                if result_force.returncode == 0 and wav_size > MIN_WAV_SIZE:
+                    logging.info(f"Successfully extracted audio by forcing format '{fmt}'")
+                    return transcribe_with_groq(wav_path, language)
+                logging.debug(f"Forcing format '{fmt}' failed (exit {result_force.returncode}, wav_size={wav_size}): {result_force.stderr.strip()}")
+            except Exception as e:
+                logging.debug(f"Forced format '{fmt}' attempt raised exception: {e}")
+
+        # All attempts failed - raise with initial stderr for context
+        raise RuntimeError(
+            f"Failed to extract audio from source file (exit code {result.returncode}): {result.stderr.strip()}"
+        )
     finally:
         if os.path.exists(src_path):
             os.unlink(src_path)
