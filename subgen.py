@@ -1,4 +1,4 @@
-subgen_version = '2026.04.17'
+subgen_version = '2026.04.18'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -1055,14 +1055,38 @@ async def asr(
         )
         
         file_content = await audio_file.read()
-        
+
+        # If the uploaded file is empty or very small, but the client provided a
+        # `video_file` path, prefer reading the media directly from disk. Some
+        # clients (or integrations) submit a tiny placeholder upload and rely on
+        # the server-side `video_file` path instead.
+        PLACEHOLDER_THRESHOLD = 2048
+
+        # If the uploaded content is empty, close and return error
         if not file_content:
             await audio_file.close()
             return {
                 "status": "error",
                 "message": "Audio file is empty"
             }
-        
+
+        # If the upload looks like a placeholder and `video_file` exists on disk,
+        # read the real file bytes from that path and use its basename for suffix.
+        audio_filename_override = None
+        try:
+            if (len(file_content) <= PLACEHOLDER_THRESHOLD) and video_file and os.path.exists(video_file):
+                try:
+                    with open(video_file, 'rb') as vf:
+                        disk_bytes = vf.read()
+                    if disk_bytes and len(disk_bytes) > len(file_content):
+                        logging.info(f"Using server-side file '{video_file}' for ASR (replacing small upload)")
+                        file_content = disk_bytes
+                        audio_filename_override = os.path.basename(video_file)
+                except Exception as e:
+                    logging.debug(f"Could not read server-side video_file '{video_file}': {e}")
+        except Exception:
+            pass
+
         audio_hash = generate_audio_hash(file_content, task, language)
         task_id = f"asr-{audio_hash}"
         
@@ -1084,7 +1108,7 @@ async def asr(
             'task': task,
             'language': final_language,
             'video_file': video_file,
-            'audio_filename': audio_file.filename,
+            'audio_filename': audio_filename_override or audio_file.filename,
             'initial_prompt': initial_prompt,
             'audio_content': file_content,
             'encode': encode,
