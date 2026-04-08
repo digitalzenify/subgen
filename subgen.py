@@ -314,6 +314,9 @@ def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filenam
     Transcribe in-memory audio bytes using Groq API.
     Writes to a temp file, extracts audio to mono 16kHz PCM WAV, handles chunking if needed, returns SRT content.
     """
+    # Minimum valid WAV file size (44-byte RIFF/WAVE header)
+    MIN_WAV_SIZE = 44
+
     # Preserve the source file extension so ffmpeg can identify the container format
     src_suffix = os.path.splitext(filename)[1] or '.wav'
 
@@ -321,8 +324,8 @@ def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filenam
         src_tmp.write(audio_bytes)
         src_path = src_tmp.name
 
-    wav_fd, wav_path = tempfile.mkstemp(suffix='.wav', prefix='subgen_extracted_')
-    os.close(wav_fd)
+    with tempfile.NamedTemporaryFile(suffix='.wav', prefix='subgen_extracted_', delete=False) as wav_tmp:
+        wav_path = wav_tmp.name
 
     try:
         # Extract audio to mono 16kHz PCM WAV before transcription/chunking.
@@ -337,7 +340,7 @@ def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filenam
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         wav_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
-        if result.returncode != 0 or wav_size <= 44:
+        if result.returncode != 0 or wav_size <= MIN_WAV_SIZE:
             # Log the source file's audio codec via ffprobe for debugging
             try:
                 probe = ffmpeg.probe(src_path)
