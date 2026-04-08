@@ -312,17 +312,58 @@ def _transcribe_single_chunk(audio_file_path: str, language: str = None, chunk_o
 def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filename: str = "audio.wav") -> str:
     """
     Transcribe in-memory audio bytes using Groq API.
-    Writes to a temp file, handles chunking if needed, returns SRT content.
+    Writes to a temp file, extracts audio to mono 16kHz PCM WAV, handles chunking if needed, returns SRT content.
     """
-    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1] or '.wav', delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-    
+    # Preserve the source file extension so ffmpeg can identify the container format
+    src_suffix = os.path.splitext(filename)[1] or '.wav'
+
+    with tempfile.NamedTemporaryFile(suffix=src_suffix, delete=False) as src_tmp:
+        src_tmp.write(audio_bytes)
+        src_path = src_tmp.name
+
+    wav_fd, wav_path = tempfile.mkstemp(suffix='.wav', prefix='subgen_extracted_')
+    os.close(wav_fd)
+
     try:
-        return transcribe_with_groq(tmp_path, language)
+        # Extract audio to mono 16kHz PCM WAV before transcription/chunking.
+        # This ensures ffmpeg always receives a well-formed audio file regardless
+        # of whether the source bytes are MKV, MP4, or any other container.
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", src_path,
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            wav_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        wav_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
+        if result.returncode != 0 or wav_size <= 44:
+            # Log the source file's audio codec via ffprobe for debugging
+            try:
+                probe = ffmpeg.probe(src_path)
+                audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
+                logging.error(
+                    f"Audio extraction failed (exit code {result.returncode}, wav_size={wav_size}). "
+                    f"Source audio streams: {[s.get('codec_name') for s in audio_streams]}. "
+                    f"ffmpeg stderr: {result.stderr.strip()}"
+                )
+            except Exception as probe_err:
+                logging.error(
+                    f"Audio extraction failed (exit code {result.returncode}, wav_size={wav_size}) "
+                    f"and ffprobe also failed: {probe_err}. "
+                    f"ffmpeg stderr: {result.stderr.strip()}"
+                )
+            raise RuntimeError(
+                f"Failed to extract audio from source file (exit code {result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+
+        return transcribe_with_groq(wav_path, language)
     finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if os.path.exists(src_path):
+            os.unlink(src_path)
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
 
 def _transcribe_chunked(audio_file_path: str, language: str = None) -> str:
     """Split audio into chunks, transcribe each, and stitch SRT together."""
@@ -444,13 +485,13 @@ def _run_ffmpeg_segment(audio_file_path: str, chunk_dir: str, config: dict) -> l
     chunk_pattern = os.path.join(chunk_dir, f"chunk_%03d.{ext}")
     
     cmd = [
-        "ffmpeg", "-i", audio_file_path,
-        "-f", "segment", "-segment_time", str(config["segment_time"]),
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", audio_file_path,
+        "-vn", "-f", "segment", "-segment_time", str(config["segment_time"]),
         "-c:a", config["codec"],
         "-ac", "1", "-ar", "16000",
         *config.get("extra_args", []),
         chunk_pattern,
-        "-y", "-loglevel", "warning"
     ]
     
     logging.debug(f"Running ffmpeg segment: {' '.join(cmd)}")
