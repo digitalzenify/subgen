@@ -1,4 +1,4 @@
-subgen_version = '2026.04.15'
+subgen_version = '2026.04.16'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -1056,6 +1056,7 @@ async def asr(
             'task': task,
             'language': final_language,
             'video_file': video_file,
+            'audio_filename': audio_file.filename,
             'initial_prompt': initial_prompt,
             'audio_content': file_content,
             'encode': encode,
@@ -1118,8 +1119,13 @@ def asr_task_worker(task_data: dict) -> None:
         language = task_data.get('language')
         file_content = task_data['audio_content']
         
-        # Write audio content to temp file for Groq API
-        srt_content = transcribe_bytes_with_groq(file_content, language=language)
+        # Determine filename to preserve the original extension so ffmpeg can detect container format
+        filename = task_data.get('audio_filename') or (
+            os.path.basename(task_data.get('video_file')) if task_data.get('video_file') else None
+        ) or 'audio.wav'
+
+        # Write audio content to temp file for Groq API (uses filename suffix to set temp file extension)
+        srt_content = transcribe_bytes_with_groq(file_content, language=language, filename=filename)
         srt_content = appendLine(srt_content)
         
         if result_container:
