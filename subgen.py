@@ -1,4 +1,4 @@
-subgen_version = '2026.04.16'
+subgen_version = '2026.04.17'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -317,8 +317,36 @@ def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filenam
     # Minimum valid WAV file size (44-byte RIFF/WAVE header)
     MIN_WAV_SIZE = 44
 
-    # Preserve the source file extension so ffmpeg can identify the container format
-    src_suffix = os.path.splitext(filename)[1] or '.wav'
+    # Try to detect the container/format from the first bytes of the upload.
+    # This avoids relying on the client-supplied filename which may be wrong
+    # (e.g. MKV bytes uploaded with a .wav filename). Fall back to filename
+    # extension and finally to '.wav'.
+    def _detect_ext_from_bytes(b: bytes) -> Optional[str]:
+        if not b or len(b) < 12:
+            return None
+        # Matroska / MKV (EBML header)
+        if b[0:4] == b"\x1A\x45\xDF\xA3":
+            return '.mkv'
+        # MP4/ISOBMFF: 'ftyp' at offset 4
+        if len(b) >= 12 and b[4:8] == b'ftyp':
+            return '.mp4'
+        # RIFF/WAVE
+        if b[0:4] == b'RIFF':
+            return '.wav'
+        # Ogg
+        if b[0:4] == b'OggS':
+            return '.ogg'
+        # FLAC
+        if b[0:4] == b'fLaC':
+            return '.flac'
+        # ID3 tag (MP3) or MP3 frame header heuristic
+        if b[0:3] == b'ID3' or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0):
+            return '.mp3'
+        return None
+
+    detected_ext = _detect_ext_from_bytes(audio_bytes[:256])
+    src_suffix = detected_ext or os.path.splitext(filename)[1] or '.wav'
+    logging.debug(f"Detected source extension '{detected_ext}' -> using suffix '{src_suffix}' for temp source file")
 
     with tempfile.NamedTemporaryFile(suffix=src_suffix, delete=False) as src_tmp:
         src_tmp.write(audio_bytes)
