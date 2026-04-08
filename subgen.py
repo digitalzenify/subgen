@@ -396,8 +396,12 @@ def _split_audio_into_chunks(audio_file_path: str, chunk_dir: str) -> list:
                 _clear_chunk_dir(chunk_dir)
                 
                 # Retry with halved segment time
-                retry_config = dict(config)
-                retry_config["segment_time"] = config["segment_time"] // 2
+                retry_config = {
+                    "codec": config["codec"],
+                    "ext": config["ext"],
+                    "extra_args": list(config["extra_args"]),
+                    "segment_time": config["segment_time"] // 2,
+                }
                 chunk_files = _run_ffmpeg_segment(audio_file_path, chunk_dir, retry_config)
                 
                 if not chunk_files:
