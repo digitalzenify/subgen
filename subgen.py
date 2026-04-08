@@ -1,4 +1,4 @@
-subgen_version = '2026.04.19'
+subgen_version = '2026.04.20'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -238,6 +238,34 @@ def init_groq_client():
     groq_client = Groq(api_key=groq_api_key)
     logging.info(f"Groq client initialized with model: {groq_model}")
 
+
+def detect_container_extension_from_bytes(b: bytes) -> Optional[str]:
+    """Detect common container/audio file extensions from the first bytes of content.
+
+    Returns an extension string including the leading dot (e.g. '.mkv') or None if unknown.
+    """
+    if not b or len(b) < 12:
+        return None
+    # Matroska / MKV (EBML header)
+    if b[0:4] == b"\x1A\x45\xDF\xA3":
+        return '.mkv'
+    # MP4/ISOBMFF: 'ftyp' at offset 4
+    if len(b) >= 12 and b[4:8] == b'ftyp':
+        return '.mp4'
+    # RIFF/WAVE
+    if b[0:4] == b'RIFF':
+        return '.wav'
+    # Ogg
+    if b[0:4] == b'OggS':
+        return '.ogg'
+    # FLAC
+    if b[0:4] == b'fLaC':
+        return '.flac'
+    # ID3 tag (MP3) or MP3 frame header heuristic
+    if b[0:3] == b'ID3' or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0):
+        return '.mp3'
+    return None
+
 def transcribe_with_groq(audio_file_path: str, language: str = None) -> str:
     """
     Transcribe an audio file using Groq API, handling chunking for large files.
@@ -317,34 +345,8 @@ def transcribe_bytes_with_groq(audio_bytes: bytes, language: str = None, filenam
     # Minimum valid WAV file size (44-byte RIFF/WAVE header)
     MIN_WAV_SIZE = 44
 
-    # Try to detect the container/format from the first bytes of the upload.
-    # This avoids relying on the client-supplied filename which may be wrong
-    # (e.g. MKV bytes uploaded with a .wav filename). Fall back to filename
-    # extension and finally to '.wav'.
-    def _detect_ext_from_bytes(b: bytes) -> Optional[str]:
-        if not b or len(b) < 12:
-            return None
-        # Matroska / MKV (EBML header)
-        if b[0:4] == b"\x1A\x45\xDF\xA3":
-            return '.mkv'
-        # MP4/ISOBMFF: 'ftyp' at offset 4
-        if len(b) >= 12 and b[4:8] == b'ftyp':
-            return '.mp4'
-        # RIFF/WAVE
-        if b[0:4] == b'RIFF':
-            return '.wav'
-        # Ogg
-        if b[0:4] == b'OggS':
-            return '.ogg'
-        # FLAC
-        if b[0:4] == b'fLaC':
-            return '.flac'
-        # ID3 tag (MP3) or MP3 frame header heuristic
-        if b[0:3] == b'ID3' or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0):
-            return '.mp3'
-        return None
-
-    detected_ext = _detect_ext_from_bytes(audio_bytes[:256])
+    # Detect container/format from the first bytes of the upload (reuse helper).
+    detected_ext = detect_container_extension_from_bytes(audio_bytes[:256])
     src_suffix = detected_ext or os.path.splitext(filename)[1] or '.wav'
     logging.debug(f"Detected source extension '{detected_ext}' -> using suffix '{src_suffix}' for temp source file")
 
@@ -1102,11 +1104,11 @@ async def asr(
         
         file_content = await audio_file.read()
 
-        # If the uploaded file is empty or very small, but the client provided a
-        # `video_file` path, prefer reading the media directly from disk. Some
-        # clients (or integrations) submit a tiny placeholder upload and rely on
-        # the server-side `video_file` path instead.
-        PLACEHOLDER_THRESHOLD = 2048
+        # If the uploaded file is empty or looks like a placeholder, prefer
+        # reading the media directly from disk when `video_file` is provided
+        # and accessible. Some integrations (e.g. Bazarr) submit a tiny
+        # placeholder upload and rely on the server-side `video_file` path.
+        PLACEHOLDER_THRESHOLD = int(os.getenv('ASR_PLACEHOLDER_THRESHOLD', '65536'))
 
         # If the uploaded content is empty, close and return error
         if not file_content:
@@ -1115,21 +1117,35 @@ async def asr(
                 "status": "error",
                 "message": "Audio file is empty"
             }
+        # Detect container type from the uploaded bytes. If unknown and the
+        # upload is small, attempt to read the `video_file` from disk (after
+        # applying `path_mapping`) and use that content instead.
+        detected_ext = detect_container_extension_from_bytes(file_content[:256])
 
-        # If the upload looks like a placeholder and `video_file` exists on disk,
-        # read the real file bytes from that path and use its basename for suffix.
         audio_filename_override = None
         try:
-            if (len(file_content) <= PLACEHOLDER_THRESHOLD) and video_file and os.path.exists(video_file):
-                try:
-                    with open(video_file, 'rb') as vf:
-                        disk_bytes = vf.read()
-                    if disk_bytes and len(disk_bytes) > len(file_content):
-                        logging.info(f"Using server-side file '{video_file}' for ASR (replacing small upload)")
-                        file_content = disk_bytes
-                        audio_filename_override = os.path.basename(video_file)
-                except Exception as e:
-                    logging.debug(f"Could not read server-side video_file '{video_file}': {e}")
+            if (detected_ext is None) and (len(file_content) <= PLACEHOLDER_THRESHOLD) and video_file:
+                candidate = path_mapping(video_file)
+                if os.path.exists(candidate):
+                    try:
+                        with open(candidate, 'rb') as vf:
+                            disk_bytes = vf.read()
+                        if disk_bytes and len(disk_bytes) > len(file_content):
+                            logging.info(f"Using server-side file '{candidate}' for ASR (replacing small upload)")
+                            file_content = disk_bytes
+                            audio_filename_override = os.path.basename(candidate)
+                    except Exception as e:
+                        logging.debug(f"Could not read server-side video_file '{candidate}': {e}")
+                else:
+                    logging.error(
+                        f"Uploaded file appears to be a small/placeholder upload and server-side video_file '{video_file}' (mapped to '{candidate}') is not accessible. "
+                        "Ensure the media path is mounted into the container or enable path mapping."
+                    )
+                    await audio_file.close()
+                    return {
+                        "status": "error",
+                        "message": "Uploaded content looks like a placeholder and server-side file is not accessible. Ensure container can read the provided 'video_file' path or upload the full media bytes." 
+                    }
         except Exception:
             pass
 
