@@ -1,4 +1,4 @@
-subgen_version = '2026.04.9'
+subgen_version = '2026.04.12'
 
 """
 ENVIRONMENT VARIABLES DOCUMENTATION
@@ -56,6 +56,7 @@ import logging
 import gc
 import hashlib
 import asyncio
+import shutil
 import subprocess
 import tempfile
 from typing import Union, Any, Optional, List
@@ -109,6 +110,7 @@ groq_model = os.getenv('GROQ_MODEL', 'whisper-large-v3-turbo')
 groq_max_chunk_size_mb = int(os.getenv('GROQ_MAX_CHUNK_SIZE_MB', 20))
 groq_retry_attempts = int(os.getenv('GROQ_RETRY_ATTEMPTS', 3))
 groq_retry_delay = int(os.getenv('GROQ_RETRY_DELAY', 5))
+GROQ_API_MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024  # Groq API 25MB upload limit
 
 # Subtitle Tag Configuration
 subtitle_tag = os.getenv('SUBTITLE_TAG', '')
@@ -327,28 +329,10 @@ def _transcribe_chunked(audio_file_path: str, language: str = None) -> str:
     chunk_dir = tempfile.mkdtemp(prefix="subgen_chunks_")
     
     try:
-        # Convert to flac chunks of ~10 minutes each using ffmpeg
-        # flac is universally available in standard ffmpeg builds (no libmp3lame needed)
-        chunk_pattern = os.path.join(chunk_dir, "chunk_%03d.flac")
-        cmd = [
-            "ffmpeg", "-i", audio_file_path,
-            "-f", "segment", "-segment_time", "600",
-            "-c:a", "flac", "-ac", "1",
-            "-ar", "16000",
-            chunk_pattern,
-            "-y", "-loglevel", "warning"
-        ]
-        
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        
-        # Get sorted chunk files
-        chunk_files = sorted([
-            os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) 
-            if f.startswith("chunk_") and f.endswith(".flac")
-        ])
+        chunk_files = _split_audio_into_chunks(audio_file_path, chunk_dir)
         
         if not chunk_files:
-            raise ValueError("No chunks produced by ffmpeg")
+            raise ValueError("Failed to split audio file into chunks")
         
         logging.info(f"Split into {len(chunk_files)} chunks")
         
@@ -373,9 +357,122 @@ def _transcribe_chunked(audio_file_path: str, language: str = None) -> str:
         return _merge_srt_entries(all_srt_entries)
         
     finally:
-        # Clean up chunk files
-        import shutil
         shutil.rmtree(chunk_dir, ignore_errors=True)
+
+def _split_audio_into_chunks(audio_file_path: str, chunk_dir: str) -> list:
+    """
+    Split audio into chunks using ffmpeg with codec fallback.
+    
+    Tries codecs in order of preference:
+    1. FLAC: native ffmpeg encoder, good compression, no external library needed
+    2. WAV/PCM: uncompressed but universally available, uses shorter segments to stay under API limit
+    
+    Returns a list of chunk file paths.
+    """
+    # Codec configurations in order of preference
+    codec_options = [
+        {"codec": "flac", "ext": "flac", "extra_args": [], "segment_time": 600},
+        {"codec": "pcm_s16le", "ext": "wav", "extra_args": [], "segment_time": 450},
+    ]
+    
+    last_error = None
+    
+    for config in codec_options:
+        try:
+            chunk_files = _run_ffmpeg_segment(audio_file_path, chunk_dir, config)
+            
+            if not chunk_files:
+                logging.warning(f"ffmpeg with codec '{config['codec']}' produced no chunks")
+                continue
+            
+            # Validate chunk sizes against Groq API limit
+            oversized = [f for f in chunk_files if os.path.getsize(f) > GROQ_API_MAX_FILE_SIZE_BYTES]
+            if oversized:
+                logging.warning(
+                    f"{len(oversized)} chunk(s) exceed Groq API 25MB limit "
+                    f"(largest: {max(os.path.getsize(f) for f in oversized) / (1024*1024):.1f}MB), "
+                    f"re-splitting with shorter segments"
+                )
+                _clear_chunk_dir(chunk_dir)
+                
+                # Retry with halved segment time
+                retry_config = {
+                    "codec": config["codec"],
+                    "ext": config["ext"],
+                    "extra_args": list(config["extra_args"]),
+                    "segment_time": config["segment_time"] // 2,
+                }
+                chunk_files = _run_ffmpeg_segment(audio_file_path, chunk_dir, retry_config)
+                
+                if not chunk_files:
+                    continue
+                
+                # Check again after re-split
+                still_oversized = [f for f in chunk_files if os.path.getsize(f) > GROQ_API_MAX_FILE_SIZE_BYTES]
+                if still_oversized:
+                    logging.warning(
+                        f"Chunks still too large after halving segment time to {retry_config['segment_time']}s, "
+                        f"trying next codec"
+                    )
+                    _clear_chunk_dir(chunk_dir)
+                    continue
+            
+            return chunk_files
+            
+        except subprocess.CalledProcessError as e:
+            stderr_msg = (e.stderr or "").strip()
+            logging.warning(
+                f"ffmpeg chunking with codec '{config['codec']}' failed "
+                f"(exit code {e.returncode}): {stderr_msg or 'no error output'}"
+            )
+            last_error = e
+            _clear_chunk_dir(chunk_dir)
+            continue
+    
+    # All codecs failed
+    if last_error:
+        stderr_msg = (last_error.stderr or "").strip()
+        raise RuntimeError(
+            f"All audio codecs failed for chunking. "
+            f"Last error (exit code {last_error.returncode}): {stderr_msg or 'no error output'}"
+        )
+    raise RuntimeError("Failed to split audio into chunks - no codec produced valid output")
+
+def _run_ffmpeg_segment(audio_file_path: str, chunk_dir: str, config: dict) -> list:
+    """Run ffmpeg segment command and return sorted list of chunk file paths."""
+    ext = config["ext"]
+    chunk_pattern = os.path.join(chunk_dir, f"chunk_%03d.{ext}")
+    
+    cmd = [
+        "ffmpeg", "-i", audio_file_path,
+        "-f", "segment", "-segment_time", str(config["segment_time"]),
+        "-c:a", config["codec"],
+        "-ac", "1", "-ar", "16000",
+        *config.get("extra_args", []),
+        chunk_pattern,
+        "-y", "-loglevel", "warning"
+    ]
+    
+    logging.debug(f"Running ffmpeg segment: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    
+    chunk_files = sorted([
+        os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir)
+        if f.startswith("chunk_") and f.endswith(f".{ext}")
+    ])
+    
+    for chunk_path in chunk_files:
+        size_mb = os.path.getsize(chunk_path) / (1024 * 1024)
+        logging.debug(f"Chunk {os.path.basename(chunk_path)}: {size_mb:.1f}MB")
+    
+    return chunk_files
+
+def _clear_chunk_dir(chunk_dir: str):
+    """Remove all files in the chunk directory."""
+    for f in os.listdir(chunk_dir):
+        filepath = os.path.join(chunk_dir, f)
+        if os.path.isfile(filepath):
+            os.unlink(filepath)
 
 def _get_audio_duration(file_path: str) -> float:
     """Get audio duration in seconds using ffprobe."""
